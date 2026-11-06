@@ -1,12 +1,11 @@
 package kvdb;
 
-import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -21,8 +20,10 @@ public final class DatabaseImpl implements Database {
     private static final int MAX_KEY_SIZE = 1024;
     private static final int MAX_VALUE_SIZE = 1024 * 1024;
     private static final int MAX_BATCH_SIZE = 10_000;
+    private static final int MAX_CONSECUTIVE_ZERO_READS = 100;
 
-    private final Index index = new Index();
+    // Replaced only after recovery fully succeeds (always accessed under 'lock').
+    private Index index = new Index();
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private WAL wal;
@@ -35,6 +36,7 @@ public final class DatabaseImpl implements Database {
     private boolean opened;
     private boolean failed;
     private long nextTransactionId = 1;
+    private boolean transactionIdsExhausted;
 
     @Override
     public void open(String path) throws IOException {
@@ -42,12 +44,13 @@ public final class DatabaseImpl implements Database {
     }
 
     @Override
-    public void open(String path, DatabaseConfig config)
-            throws IOException {
+    public void open(String path, DatabaseConfig config) throws IOException {
 
         lock.writeLock().lock();
 
         try {
+            // Checked before acquiring anything, so a failed second open()
+            // can never release the lock held by the live instance.
             if (opened) {
                 throw new IOException("Database is already open");
             }
@@ -56,83 +59,107 @@ public final class DatabaseImpl implements Database {
                 throw new IllegalArgumentException("Invalid open arguments");
             }
 
-            databasePath = Paths.get(path).toAbsolutePath().normalize();
-
-            Path parent = databasePath.getParent();
-
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
-
-            // Acquire process-level lock before touching the database.
-            Path lockPath = databasePath.resolveSibling(
-                    databasePath.getFileName().toString() + ".lock");
-
-            lockChannel = FileChannel.open(
-                    lockPath,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE);
-
             try {
-                processLock = lockChannel.tryLock();
-            } catch (OverlappingFileLockException e) {
-                processLock = null;
-            }
-
-            if (processLock == null) {
-                throw new IOException(
-                        "Database is already open in another process");
-            }
-
-            index.clear();
-            nextTransactionId = 1;
-            failed = false;
-
-            reader = FileChannel.open(
-                    databasePath,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE);
-
-            try {
-                recover();
-
-                wal = new WAL();
-                wal.open(databasePath, config.getMaxFileBytes());
-
-                opened = true;
-
+                openInternal(path, config);
             } catch (IOException | RuntimeException e) {
-
-                if (wal != null) {
-                    try {
-                        wal.close();
-                    } catch (IOException closeError) {
-                        e.addSuppressed(closeError);
-                    }
-                    wal = null;
-                }
-
-                if (reader != null) {
-                    try {
-                        reader.close();
-                    } catch (IOException closeError) {
-                        e.addSuppressed(closeError);
-                    }
-                    reader = null;
-                }
-
+                cleanupFailedOpen(e);
                 throw e;
             }
-
-        } catch (IOException | RuntimeException e) {
-
-            releaseProcessLock(e);
-            throw e;
 
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    private void openInternal(String path, DatabaseConfig config) throws IOException {
+
+        databasePath = Paths.get(path).toAbsolutePath().normalize();
+
+        Path parent = databasePath.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+
+        // 1. Process-level lock, held until close().
+        Path lockPath = databasePath.resolveSibling(
+                databasePath.getFileName().toString() + ".lock");
+
+        lockChannel = FileChannel.open(
+                lockPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE);
+
+        try {
+            processLock = lockChannel.tryLock();
+        } catch (OverlappingFileLockException e) {
+            processLock = null;
+        }
+
+        if (processLock == null) {
+            throw new IOException("Database is already open in another process");
+        }
+
+        failed = false;
+
+        // 2. Open the database file.
+        reader = FileChannel.open(
+                databasePath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE);
+
+        // 3. Recover into a staging index; publish it only on success.
+        Index staged = new Index();
+        Recovery.Report report = Recovery.recover(databasePath, staged);
+
+        // 4. Initialise the next transaction id without overflow.
+        long maxTxId = report.maxTxId(); // -1 if no valid record was seen
+        if (maxTxId < 1) {
+            nextTransactionId = 1;
+            transactionIdsExhausted = false;
+        } else if (maxTxId == Long.MAX_VALUE) {
+            nextTransactionId = Long.MAX_VALUE;
+            transactionIdsExhausted = true;
+        } else {
+            nextTransactionId = maxTxId + 1;
+            transactionIdsExhausted = false;
+        }
+
+        index = staged;
+
+        // 5. WAL writer.
+        wal = new WAL();
+        wal.open(databasePath, config.getMaxFileBytes());
+
+        // 6. Success.
+        opened = true;
+    }
+
+    /** Closes everything acquired by a failed open() and discards staged state. */
+    private void cleanupFailedOpen(Exception error) {
+        index = new Index();
+        nextTransactionId = 1;
+        transactionIdsExhausted = false;
+
+        if (wal != null) {
+            try {
+                wal.close();
+            } catch (IOException closeError) {
+                error.addSuppressed(closeError);
+            }
+            wal = null;
+        }
+
+        if (reader != null) {
+            try {
+                reader.close();
+            } catch (IOException closeError) {
+                error.addSuppressed(closeError);
+            }
+            reader = null;
+        }
+
+        releaseProcessLock(error);
     }
 
     private void releaseProcessLock(Exception originalError) {
@@ -158,6 +185,27 @@ public final class DatabaseImpl implements Database {
         }
     }
 
+    /**
+     * Returns the next transaction id, never wrapping or reusing one.
+     * Throws before any WAL modification when ids are exhausted, so the
+     * instance is NOT marked failed in that case.
+     */
+    private long allocateTransactionId() throws IOException {
+        if (transactionIdsExhausted) {
+            throw new IOException("Transaction ids exhausted; no further writes possible");
+        }
+
+        long id = nextTransactionId;
+
+        if (id == Long.MAX_VALUE) {
+            transactionIdsExhausted = true; // this is the last usable id
+        } else {
+            nextTransactionId = id + 1;
+        }
+
+        return id;
+    }
+
     @Override
     public void put(byte[] key, byte[] value) throws IOException {
         ByteArrayKey wrappedKey = new ByteArrayKey(key);
@@ -172,10 +220,14 @@ public final class DatabaseImpl implements Database {
 
         lock.writeLock().lock();
 
+        boolean walTouched = false;
+
         try {
             ensureOpen();
 
-            long txId = nextTransactionId++;
+            long txId = allocateTransactionId();
+
+            walTouched = true; // from here the WAL state may be uncertain
             long offset = wal.append(RecordType.PUT, txId, payload);
 
             wal.force();
@@ -186,6 +238,11 @@ public final class DatabaseImpl implements Database {
             index.put(wrappedKey,
                     new ValueLocation(valueOffset, valueBytes.length));
 
+        } catch (IOException | RuntimeException e) {
+            if (walTouched || (wal != null && wal.isFailed())) {
+                failed = true;
+            }
+            throw e;
         } finally {
             lock.writeLock().unlock();
         }
@@ -233,34 +290,36 @@ public final class DatabaseImpl implements Database {
         ByteArrayKey wrappedKey = new ByteArrayKey(key);
         byte[] keyBytes = wrappedKey.bytes();
 
-        ByteBuffer payload = ByteBuffer.allocate(4 + keyBytes.length)
-                .order(ByteOrder.BIG_ENDIAN);
-
-        payload.putInt(keyBytes.length);
-        payload.put(keyBytes);
+        byte[] payload = encodeDelete(keyBytes);
 
         lock.writeLock().lock();
+
+        boolean walTouched = false;
 
         try {
             ensureOpen();
 
-            wal.append(
-                    RecordType.DELETE,
-                    nextTransactionId++,
-                    payload.array());
+            long txId = allocateTransactionId();
+
+            walTouched = true;
+            wal.append(RecordType.DELETE, txId, payload);
 
             wal.force();
 
             index.remove(wrappedKey);
 
+        } catch (IOException | RuntimeException e) {
+            if (walTouched) {
+                failed = true;
+            }
+            throw e;
         } finally {
             lock.writeLock().unlock();
         }
     }
 
     @Override
-    public void batch(List<BatchOperation> operations)
-            throws IOException {
+    public void batch(List<BatchOperation> operations) throws IOException {
 
         if (operations == null || operations.isEmpty()
                 || operations.size() > MAX_BATCH_SIZE) {
@@ -280,8 +339,7 @@ public final class DatabaseImpl implements Database {
             byte[] key = operation.getKey();
             byte[] value = operation.getValue();
 
-            // Revalidate using the same limits as ordinary operations.
-            new ByteArrayKey(key);
+            new ByteArrayKey(key); // same key limits as ordinary operations
 
             if (operation.getType() == BatchOperation.Type.PUT) {
                 if (value == null || value.length > MAX_VALUE_SIZE) {
@@ -296,23 +354,23 @@ public final class DatabaseImpl implements Database {
 
         lock.writeLock().lock();
 
-        boolean transactionStarted = false;
+        boolean walTouched = false;
 
         try {
             ensureOpen();
 
-            long txId = nextTransactionId++;
+            long txId = allocateTransactionId();
 
             ByteBuffer beginPayload = ByteBuffer.allocate(4)
                     .order(ByteOrder.BIG_ENDIAN);
-
             beginPayload.putInt(safeOperations.size());
 
+            // Set BEFORE the append: a partially written BEGIN that throws
+            // must still leave this instance failed.
+            walTouched = true;
             wal.append(RecordType.BEGIN, txId, beginPayload.array());
-            transactionStarted = true;
 
             CRC32C transactionChecksum = new CRC32C();
-
             List<PendingOperation> pending = new ArrayList<>();
 
             for (BatchOperation operation : safeOperations) {
@@ -322,35 +380,32 @@ public final class DatabaseImpl implements Database {
                 RecordType recordType;
 
                 if (operation.getType() == BatchOperation.Type.PUT) {
-                    byte[] value = operation.getValue();
-
-                    payload = encodePut(key, value);
+                    payload = encodePut(key, operation.getValue());
                     recordType = RecordType.PUT;
                 } else {
-                    ByteBuffer deletePayload = ByteBuffer.allocate(4 + key.length)
-                            .order(ByteOrder.BIG_ENDIAN);
-
-                    deletePayload.putInt(key.length);
-                    deletePayload.put(key);
-
-                    payload = deletePayload.array();
+                    payload = encodeDelete(key);
                     recordType = RecordType.DELETE;
                 }
 
                 long recordOffset = wal.append(recordType, txId, payload);
 
                 byte[] encodedRecord = RecordCodec.encode(recordType, txId, payload);
+                transactionChecksum.update(encodedRecord, 0, encodedRecord.length);
 
-                transactionChecksum.update(encodedRecord, 0,
-                        encodedRecord.length);
+                long valueOffset = -1;
+                int valueLength = 0;
+                if (recordType == RecordType.PUT) {
+                    valueLength = operation.getValue().length;
+                    valueOffset = recordOffset + RecordCodec.HEADER_SIZE
+                            + 8 + key.length;
+                }
 
                 pending.add(new PendingOperation(
-                        recordType, payload, recordOffset));
+                        recordType, new ByteArrayKey(key), valueOffset, valueLength));
             }
 
             ByteBuffer commitPayload = ByteBuffer.allocate(8)
                     .order(ByteOrder.BIG_ENDIAN);
-
             commitPayload.putInt(safeOperations.size());
             commitPayload.putInt((int) transactionChecksum.getValue());
 
@@ -359,18 +414,19 @@ public final class DatabaseImpl implements Database {
             // No index changes before this succeeds.
             wal.force();
 
-            // Apply all changes while holding the write lock.
-            for (PendingOperation operation : pending) {
-                applyRecoveredRecord(
-                        operation.type,
-                        operation.payload,
-                        operation.offset);
+            // Apply while still holding the write lock: atomic for readers.
+            for (PendingOperation op : pending) {
+                if (op.type == RecordType.PUT) {
+                    index.put(op.key, new ValueLocation(op.valueOffset, op.valueLength));
+                } else {
+                    index.remove(op.key);
+                }
             }
 
         } catch (IOException | RuntimeException e) {
-            // A partially written transaction must not be followed
-            // by more operations in this database instance.
-            if (transactionStarted) {
+            // Rejected before any WAL modification (closed, ids exhausted):
+            // not failed. Anything after the first append: uncertain -> failed.
+            if (walTouched) {
                 failed = true;
             }
             throw e;
@@ -381,8 +437,7 @@ public final class DatabaseImpl implements Database {
     }
 
     private byte[] encodePut(byte[] key, byte[] value) {
-        ByteBuffer payload = ByteBuffer.allocate(
-                8 + key.length + value.length)
+        ByteBuffer payload = ByteBuffer.allocate(8 + key.length + value.length)
                 .order(ByteOrder.BIG_ENDIAN);
 
         payload.putInt(key.length);
@@ -393,239 +448,41 @@ public final class DatabaseImpl implements Database {
         return payload.array();
     }
 
-    private void recover() throws IOException {
-
-        long offset = 0;
-        long fileSize = reader.size();
-
-        long pendingStart = -1;
-        long pendingTxId = -1;
-        int expectedCount = 0;
-
-        List<PendingOperation> pending = new ArrayList<>();
-        CRC32C transactionChecksum = new CRC32C();
-
-        while (offset < fileSize) {
-
-            ByteBuffer header = ByteBuffer.allocate(
-                    RecordCodec.HEADER_SIZE);
-
-            int headerBytes = readAtMost(reader, header, offset);
-
-            if (headerBytes < RecordCodec.HEADER_SIZE) {
-                truncateIncompleteTail(
-                        pendingStart >= 0 ? pendingStart : offset);
-                return;
-            }
-
-            header.flip().order(ByteOrder.BIG_ENDIAN);
-
-            int payloadLength = header.getInt(16);
-
-            if (payloadLength < 0
-                    || payloadLength > RecordCodec.MAX_PAYLOAD_SIZE) {
-                throw new IOException("Invalid payload length at " + offset);
-            }
-
-            ByteBuffer record = ByteBuffer.allocate(
-                    RecordCodec.HEADER_SIZE + payloadLength);
-
-            header.rewind();
-            record.put(header);
-
-            ByteBuffer payload = ByteBuffer.allocate(payloadLength);
-
-            int payloadBytes = readAtMost(
-                    reader, payload, offset + RecordCodec.HEADER_SIZE);
-
-            if (payloadBytes < payloadLength) {
-                truncateIncompleteTail(
-                        pendingStart >= 0 ? pendingStart : offset);
-                return;
-            }
-
-            payload.flip();
-            record.put(payload);
-            record.flip();
-
-            RecordCodec.DecodedRecord decoded = RecordCodec.decode(record);
-
-            RecordType type = decoded.getType();
-            long txId = decoded.getTransactionId();
-            byte[] recordPayload = decoded.getPayload();
-
-            if (type == RecordType.BEGIN) {
-
-                if (pendingStart >= 0 || recordPayload.length != 4) {
-                    throw new IOException("Invalid BEGIN record");
-                }
-
-                ByteBuffer begin = ByteBuffer.wrap(recordPayload)
-                        .order(ByteOrder.BIG_ENDIAN);
-
-                expectedCount = begin.getInt();
-
-                if (expectedCount < 1 || expectedCount > MAX_BATCH_SIZE) {
-                    throw new IOException("Invalid batch operation count");
-                }
-
-                pendingStart = offset;
-                pendingTxId = txId;
-                pending.clear();
-                transactionChecksum = new CRC32C();
-
-            } else if (type == RecordType.COMMIT) {
-
-                if (pendingStart < 0 || txId != pendingTxId
-                        || recordPayload.length != 8) {
-                    throw new IOException("Invalid COMMIT record");
-                }
-
-                ByteBuffer commit = ByteBuffer.wrap(recordPayload)
-                        .order(ByteOrder.BIG_ENDIAN);
-
-                int actualCount = commit.getInt();
-                int expectedChecksum = commit.getInt();
-
-                if (actualCount != expectedCount
-                        || pending.size() != expectedCount
-                        || expectedChecksum != (int) transactionChecksum.getValue()) {
-                    throw new IOException("Batch transaction validation failed");
-                }
-
-                // Commit is valid. Apply the whole transaction.
-                for (PendingOperation operation : pending) {
-                    applyRecoveredRecord(
-                            operation.type,
-                            operation.payload,
-                            operation.offset);
-                }
-
-                pending.clear();
-                pendingStart = -1;
-                pendingTxId = -1;
-                expectedCount = 0;
-
-            } else {
-
-                if (pendingStart >= 0) {
-
-                    if (txId != pendingTxId
-                            || pending.size() >= expectedCount) {
-                        throw new IOException(
-                                "Invalid operation inside batch");
-                    }
-
-                    byte[] encoded = RecordCodec.encode(type, txId, recordPayload);
-
-                    transactionChecksum.update(encoded, 0, encoded.length);
-
-                    pending.add(new PendingOperation(
-                            type, recordPayload, offset));
-
-                } else {
-
-                    if (type != RecordType.PUT
-                            && type != RecordType.DELETE) {
-                        throw new IOException("Unexpected record type");
-                    }
-
-                    applyRecoveredRecord(type, recordPayload, offset);
-                }
-            }
-
-            nextTransactionId = Math.max(nextTransactionId, txId + 1);
-
-            offset += RecordCodec.HEADER_SIZE + payloadLength;
-        }
-
-        // A complete sequence without COMMIT is not a committed batch.
-        if (pendingStart >= 0) {
-            truncateIncompleteTail(pendingStart);
-        }
-    }
-
-    private void applyRecoveredRecord(
-            RecordType type,
-            byte[] recordPayload,
-            long recordOffset) throws IOException {
-
-        ByteBuffer payload = ByteBuffer.wrap(recordPayload)
+    private byte[] encodeDelete(byte[] key) {
+        ByteBuffer payload = ByteBuffer.allocate(4 + key.length)
                 .order(ByteOrder.BIG_ENDIAN);
 
-        if (type == RecordType.PUT) {
+        payload.putInt(key.length);
+        payload.put(key);
 
-            if (payload.remaining() < 8) {
-                throw new IOException("Invalid PUT payload");
-            }
-
-            int keyLength = payload.getInt();
-            int valueLength = payload.getInt();
-
-            if (keyLength < 1 || keyLength > MAX_KEY_SIZE
-                    || valueLength < 0 || valueLength > MAX_VALUE_SIZE
-                    || payload.remaining() != keyLength + valueLength) {
-                throw new IOException("Invalid PUT payload lengths");
-            }
-
-            byte[] key = new byte[keyLength];
-            payload.get(key);
-
-            long valueOffset = recordOffset
-                    + RecordCodec.HEADER_SIZE + 8 + keyLength;
-
-            index.put(new ByteArrayKey(key),
-                    new ValueLocation(valueOffset, valueLength));
-
-        } else if (type == RecordType.DELETE) {
-
-            if (payload.remaining() < 4) {
-                throw new IOException("Invalid DELETE payload");
-            }
-
-            int keyLength = payload.getInt();
-
-            if (keyLength < 1 || keyLength > MAX_KEY_SIZE
-                    || payload.remaining() != keyLength) {
-                throw new IOException("Invalid DELETE payload length");
-            }
-
-            byte[] key = new byte[keyLength];
-            payload.get(key);
-
-            index.remove(new ByteArrayKey(key));
-
-        } else {
-            throw new IOException("Unsupported operation record");
-        }
+        return payload.array();
     }
 
-    private void truncateIncompleteTail(long validLength)
+    /**
+     * Reads until the buffer is full or EOF. Zero-byte reads are bounded, not EOF.
+     */
+    private int readAtMost(FileChannel channel, ByteBuffer buffer, long position)
             throws IOException {
 
-        reader.truncate(validLength);
-        reader.force(true);
-    }
-
-    private int readAtMost(
-            FileChannel channel,
-            ByteBuffer buffer,
-            long position) throws IOException {
-
         int totalRead = 0;
+        int zeroReads = 0;
 
         while (buffer.hasRemaining()) {
             int count = channel.read(buffer, position + totalRead);
 
             if (count < 0) {
-                break;
+                break; // EOF
             }
 
             if (count == 0) {
+                if (++zeroReads > MAX_CONSECUTIVE_ZERO_READS) {
+                    throw new IOException("Channel repeatedly returned zero bytes");
+                }
                 Thread.onSpinWait();
                 continue;
             }
 
+            zeroReads = 0;
             totalRead += count;
         }
 
@@ -670,10 +527,12 @@ public final class DatabaseImpl implements Database {
                     failure.addSuppressed(e);
                 }
             }
+
             wal = null;
             reader = null;
             opened = false;
             failed = false;
+            index = new Index();
 
             try {
                 if (processLock != null && processLock.isValid()) {
@@ -712,15 +571,19 @@ public final class DatabaseImpl implements Database {
         }
     }
 
+    /** Key and value location only; no payload is retained. */
     private static final class PendingOperation {
         final RecordType type;
-        final byte[] payload;
-        final long offset;
+        final ByteArrayKey key;
+        final long valueOffset;
+        final int valueLength;
 
-        PendingOperation(RecordType type, byte[] payload, long offset) {
+        PendingOperation(RecordType type, ByteArrayKey key,
+                long valueOffset, int valueLength) {
             this.type = type;
-            this.payload = payload.clone();
-            this.offset = offset;
+            this.key = key;
+            this.valueOffset = valueOffset;
+            this.valueLength = valueLength;
         }
     }
 }

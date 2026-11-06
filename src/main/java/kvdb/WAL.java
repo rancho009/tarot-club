@@ -9,6 +9,8 @@ import java.nio.file.StandardOpenOption;
 
 public final class WAL implements AutoCloseable {
 
+    private static final int MAX_CONSECUTIVE_ZERO_WRITES = 100;
+
     private FileChannel channel;
     private long maxFileBytes;
     private boolean failed;
@@ -53,6 +55,8 @@ public final class WAL implements AutoCloseable {
      *
      * @return the byte offset at which the record begins.
      *         This method does not force the record to disk.
+     *
+     * @throws IOException if the append fails or the size limit is exceeded.
      */
     public synchronized long append(
             RecordType type,
@@ -66,7 +70,10 @@ public final class WAL implements AutoCloseable {
 
         long offset = channel.size();
 
-        if (record.length > maxFileBytes - offset) {
+        // This rejection happens before writing anything.
+        // Therefore, it does not put the WAL into a failed state.
+        if (offset > maxFileBytes
+                || record.length > maxFileBytes - offset) {
             throw new IOException("Maximum WAL file size exceeded");
         }
 
@@ -76,8 +83,7 @@ public final class WAL implements AutoCloseable {
             writeFully(buffer, offset);
             return offset;
         } catch (IOException e) {
-            // A partial record may have reached disk.
-            // Do not allow further writes in this session.
+            // A partial record may have reached the file.
             failed = true;
             throw e;
         }
@@ -85,7 +91,7 @@ public final class WAL implements AutoCloseable {
 
     /**
      * Forces all previously appended records to stable storage.
-     * Call this before acknowledging a successful operation.
+     * Must succeed before acknowledging a successful operation.
      */
     public synchronized void force() throws IOException {
         ensureUsable();
@@ -106,10 +112,23 @@ public final class WAL implements AutoCloseable {
         return channel.size();
     }
 
+    /**
+     * Indicates whether a write or force operation has left
+     * the WAL in an uncertain state.
+     */
+    public synchronized boolean isFailed() {
+        return failed;
+    }
+
+    /**
+     * Writes the entire buffer at the specified file position.
+     * Repeated zero-byte writes are bounded to prevent infinite loops.
+     */
     private void writeFully(ByteBuffer buffer, long offset)
             throws IOException {
 
         long position = offset;
+        int zeroWrites = 0;
 
         while (buffer.hasRemaining()) {
             int written = channel.write(buffer, position);
@@ -119,10 +138,18 @@ public final class WAL implements AutoCloseable {
             }
 
             if (written == 0) {
+                zeroWrites++;
+
+                if (zeroWrites > MAX_CONSECUTIVE_ZERO_WRITES) {
+                    throw new IOException(
+                            "Channel repeatedly returned zero bytes");
+                }
+
                 Thread.onSpinWait();
                 continue;
             }
 
+            zeroWrites = 0;
             position += written;
         }
     }
@@ -171,5 +198,4 @@ public final class WAL implements AutoCloseable {
             throw failure;
         }
     }
-
 }
