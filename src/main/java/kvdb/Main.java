@@ -1,4 +1,4 @@
-package main.java.kvdb;
+package kvdb;
 
 public class Main {
     public static void main(String[] args) {
