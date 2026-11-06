@@ -1,4 +1,6 @@
-# Java build output
+@"
+
+# Build files
 out/
 target/
 build/
@@ -9,15 +11,14 @@ build/
 .vscode/
 *.iml
 
-# Database and WAL files
+# Database runtime files
 *.db
 *.wal
 *.lock
+*.log
 *.oracle.jsonl
 
-# Logs
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
+# Go cache and executable
+torture/.gocache/
+torture/tarot-torture.exe
+"@ | Add-Content .gitignore
