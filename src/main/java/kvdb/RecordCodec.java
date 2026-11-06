@@ -135,6 +135,9 @@ public final class RecordCodec {
         crc.update(payload, 0, payload.length);
 
         int calculatedChecksum = (int) crc.getValue();
+        if (calculatedChecksum != storedChecksum) {
+            throw new IOException("Record checksum mismatch");
+        }
 
         // Advance the original buffer only after successful decoding.
         source.position(buffer.position());
