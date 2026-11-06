@@ -22,22 +22,22 @@ public class WALTest {
         Path path = Files.createTempFile("wal-test", ".db");
 
         try {
-            WAL wal = new WAL();
-            wal.open(path);
+            try (WAL wal = new WAL()) {
+                wal.open(path);
 
-            byte[] payload = { 10, 20, 30 };
+                byte[] payload = { 10, 20, 30 };
 
-            long offset = wal.append(
-                    RecordType.PUT, 1L, payload);
+                long offset = wal.append(
+                        RecordType.PUT, 1L, payload);
 
-            check(offset == 0, "First record must start at offset 0");
+                check(offset == 0,
+                        "First record must start at offset 0");
 
-            wal.force();
+                wal.force();
 
-            check(wal.size() == 27,
-                    "Unexpected file size");
-
-            wal.close();
+                check(wal.size() == 27,
+                        "Unexpected file size");
+            }
 
             byte[] fileBytes = Files.readAllBytes(path);
 
@@ -58,24 +58,28 @@ public class WALTest {
         Path path = Files.createTempFile("wal-test", ".db");
 
         try {
-            WAL wal = new WAL();
-            wal.open(path);
+            try (WAL wal = new WAL()) {
+                wal.open(path);
 
-            long first = wal.append(
-                    RecordType.PUT, 1L, new byte[] { 1, 2 });
+                long first = wal.append(
+                        RecordType.PUT, 1L,
+                        new byte[] { 1, 2 });
 
-            long second = wal.append(
-                    RecordType.DELETE, 2L, new byte[] { 3, 4, 5 });
+                long second = wal.append(
+                        RecordType.DELETE, 2L,
+                        new byte[] { 3, 4, 5 });
 
-            check(first == 0, "Incorrect first offset");
-            check(second == 26, "Incorrect second offset");
+                check(first == 0,
+                        "Incorrect first offset");
 
-            wal.force();
+                check(second == 26,
+                        "Incorrect second offset");
 
-            check(wal.size() == 53,
-                    "Unexpected size after two records");
+                wal.force();
 
-            wal.close();
+                check(wal.size() == 53,
+                        "Unexpected size after two records");
+            }
 
         } finally {
             Files.deleteIfExists(path);
@@ -86,25 +90,26 @@ public class WALTest {
         Path path = Files.createTempFile("wal-test", ".db");
 
         try {
-            WAL firstWal = new WAL();
-            firstWal.open(path);
+            try (WAL firstWal = new WAL()) {
+                firstWal.open(path);
 
-            firstWal.append(
-                    RecordType.PUT, 1L, new byte[] { 1 });
+                firstWal.append(
+                        RecordType.PUT, 1L,
+                        new byte[] { 1 });
+            }
 
-            firstWal.close();
+            try (WAL secondWal = new WAL()) {
+                secondWal.open(path);
 
-            WAL secondWal = new WAL();
-            secondWal.open(path);
+                long offset = secondWal.append(
+                        RecordType.DELETE, 2L,
+                        new byte[] { 2 });
 
-            long offset = secondWal.append(
-                    RecordType.DELETE, 2L, new byte[] { 2 });
+                check(offset == 25,
+                        "Reopened WAL did not append at end");
 
-            check(offset == 25,
-                    "Reopened WAL did not append at end");
-
-            secondWal.force();
-            secondWal.close();
+                secondWal.force();
+            }
 
         } finally {
             Files.deleteIfExists(path);
@@ -115,24 +120,25 @@ public class WALTest {
         Path path = Files.createTempFile("wal-test", ".db");
 
         try {
-            WAL wal = new WAL();
-            wal.open(path, 25);
+            try (WAL wal = new WAL()) {
+                wal.open(path, 25);
 
-            wal.append(
-                    RecordType.PUT, 1L, new byte[] { 1 });
-
-            try {
                 wal.append(
-                        RecordType.PUT, 2L, new byte[] { 2 });
+                        RecordType.PUT, 1L,
+                        new byte[] { 1 });
 
-                throw new AssertionError(
-                        "WAL accepted data beyond maximum size");
+                try {
+                    wal.append(
+                            RecordType.PUT, 2L,
+                            new byte[] { 2 });
 
-            } catch (IOException expected) {
-                // Expected.
+                    throw new AssertionError(
+                            "WAL accepted data beyond maximum size");
+
+                } catch (IOException expected) {
+                    // Expected.
+                }
             }
-
-            wal.close();
 
         } finally {
             Files.deleteIfExists(path);
@@ -142,14 +148,16 @@ public class WALTest {
     private static void testOperationsAfterClose() throws Exception {
         Path path = Files.createTempFile("wal-test", ".db");
 
+        WAL wal = new WAL();
+
         try {
-            WAL wal = new WAL();
             wal.open(path);
             wal.close();
 
             try {
                 wal.append(
-                        RecordType.PUT, 1L, new byte[] { 1 });
+                        RecordType.PUT, 1L,
+                        new byte[] { 1 });
 
                 throw new AssertionError(
                         "Append after close was accepted");
@@ -159,6 +167,7 @@ public class WALTest {
             }
 
         } finally {
+            wal.close();
             Files.deleteIfExists(path);
         }
     }
