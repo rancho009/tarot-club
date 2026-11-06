@@ -5,38 +5,59 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.zip.CRC32C;
 
+@SuppressWarnings("try")
 public final class DatabaseImpl implements Database {
 
     private static final int MAX_KEY_SIZE = 1024;
     private static final int MAX_VALUE_SIZE = 1024 * 1024;
     private static final int MAX_BATCH_SIZE = 10_000;
     private static final int MAX_CONSECUTIVE_ZERO_READS = 100;
+    private static final int GENERATION_SLOT_SIZE = 16;
+    private static final int GENERATION_FILE_SIZE = GENERATION_SLOT_SIZE * 2;
+    private static final ConcurrentHashMap<Path, ReentrantLock> JVM_PATH_LOCKS =
+            new ConcurrentHashMap<>();
+    private final DatabaseFaultInjector faultInjector;
 
     // Replaced only after recovery fully succeeds (always accessed under 'lock').
     private Index index = new Index();
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private WAL wal;
-    private FileChannel reader;
     private Path databasePath;
-
-    private FileChannel lockChannel;
-    private FileLock processLock;
+    private Path lockPath;
+    private ReentrantLock jvmPathLock;
+    private long maxFileBytes = DatabaseConfig.DEFAULT_MAX_FILE_BYTES;
+    private long fileGeneration;
 
     private boolean opened;
     private boolean failed;
     private long nextTransactionId = 1;
     private boolean transactionIdsExhausted;
+    private long recoveredEnd;
+    private long recoveredMaxTxId = -1;
+
+    public DatabaseImpl() {
+        this(DatabaseFaultInjector.NONE);
+    }
+
+    DatabaseImpl(DatabaseFaultInjector faultInjector) {
+        this.faultInjector = java.util.Objects.requireNonNull(faultInjector,
+                "faultInjector");
+    }
 
     @Override
     public void open(String path) throws IOException {
@@ -61,6 +82,20 @@ public final class DatabaseImpl implements Database {
 
             try {
                 openInternal(path, config);
+                try (Coordination ignored = acquireCoordination()) {
+                    try (FileChannel ignoredReader = FileChannel.open(
+                            databasePath,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.READ,
+                            StandardOpenOption.WRITE)) {
+                        // The handle is closed before open() releases the path lock.
+                    }
+                    maxFileBytes = config.getMaxFileBytes();
+                    initializeFromWal();
+                    fileGeneration = ignored.generation;
+                    cleanupOrphanCompactionFiles();
+                    opened = true;
+                }
             } catch (IOException | RuntimeException e) {
                 cleanupFailedOpen(e);
                 throw e;
@@ -80,40 +115,30 @@ public final class DatabaseImpl implements Database {
             Files.createDirectories(parent);
         }
 
-        // 1. Process-level lock, held until close().
-        Path lockPath = databasePath.resolveSibling(
+        // The lock file is stable for this database path; locks are acquired per operation.
+        lockPath = databasePath.resolveSibling(
                 databasePath.getFileName().toString() + ".lock");
-
-        lockChannel = FileChannel.open(
-                lockPath,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE);
-
-        try {
-            processLock = lockChannel.tryLock();
-        } catch (OverlappingFileLockException e) {
-            processLock = null;
-        }
-
-        if (processLock == null) {
-            throw new IOException("Database is already open in another process");
-        }
+        jvmPathLock = JVM_PATH_LOCKS.computeIfAbsent(databasePath, ignored -> new ReentrantLock());
+        maxFileBytes = config.getMaxFileBytes();
 
         failed = false;
 
-        // 2. Open the database file.
-        reader = FileChannel.open(
-                databasePath,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE);
+    }
 
-        // 3. Recover into a staging index; publish it only on success.
+    private void initializeFromWal() throws IOException {
         Index staged = new Index();
         Recovery.Report report = Recovery.recover(databasePath, staged);
+        publishRecovery(staged, report);
+    }
 
-        // 4. Initialise the next transaction id without overflow.
-        long maxTxId = report.maxTxId(); // -1 if no valid record was seen
+    private void publishRecovery(Index recoveredIndex, Recovery.Report report) {
+        index = recoveredIndex;
+        recoveredEnd = report.committedEnd();
+        recoveredMaxTxId = report.maxTxId();
+        updateNextTransactionId(recoveredMaxTxId);
+    }
+
+    private void updateNextTransactionId(long maxTxId) {
         if (maxTxId < 1) {
             nextTransactionId = 1;
             transactionIdsExhausted = false;
@@ -125,14 +150,22 @@ public final class DatabaseImpl implements Database {
             transactionIdsExhausted = false;
         }
 
-        index = staged;
+    }
 
-        // 5. WAL writer.
-        wal = new WAL();
-        wal.open(databasePath, config.getMaxFileBytes());
+    private void openWalForOperation() throws IOException {
+        if (wal != null) {
+            throw new IOException("WAL operation is already active");
+        }
+        wal = new WAL(faultInjector);
+        wal.open(databasePath, maxFileBytes);
+    }
 
-        // 6. Success.
-        opened = true;
+    private void closeWalForOperation() throws IOException {
+        WAL activeWal = wal;
+        wal = null;
+        if (activeWal != null) {
+            activeWal.close();
+        }
     }
 
     /** Closes everything acquired by a failed open() and discards staged state. */
@@ -150,39 +183,238 @@ public final class DatabaseImpl implements Database {
             wal = null;
         }
 
-        if (reader != null) {
-            try {
-                reader.close();
-            } catch (IOException closeError) {
-                error.addSuppressed(closeError);
-            }
-            reader = null;
-        }
-
-        releaseProcessLock(error);
     }
 
-    private void releaseProcessLock(Exception originalError) {
-
+    /** Acquires the shared JVM lock, then an exclusive OS lock on the stable lock file. */
+    private Coordination acquireCoordination() throws IOException {
+        boolean jvmLocked = false;
+        FileChannel channel = null;
+        FileLock fileLock = null;
         try {
-            if (processLock != null && processLock.isValid()) {
-                processLock.release();
+            try {
+                jvmPathLock.lockInterruptibly();
+                jvmLocked = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for database JVM lock", e);
             }
-        } catch (IOException e) {
-            originalError.addSuppressed(e);
-        } finally {
-            processLock = null;
+            channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
+            try {
+                fileLock = channel.lock();
+            } catch (java.nio.channels.FileLockInterruptionException
+                    | java.nio.channels.ClosedByInterruptException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for database process lock", e);
+            }
+            GenerationState generation = readGeneration(channel);
+            return new Coordination(jvmPathLock, channel, fileLock,
+                    generation.value, generation.slot);
+        } catch (IOException | RuntimeException e) {
+            if (fileLock != null) {
+                try { fileLock.release(); } catch (IOException closeError) { e.addSuppressed(closeError); }
+            }
+            if (channel != null) {
+                try { channel.close(); } catch (IOException closeError) { e.addSuppressed(closeError); }
+            }
+            if (jvmLocked) {
+                jvmPathLock.unlock();
+            }
+            throw e;
+        }
+    }
+
+    private static final class Coordination implements AutoCloseable {
+        private final ReentrantLock jvmLock;
+        private final FileChannel channel;
+        private final FileLock fileLock;
+        private long generation;
+        private int generationSlot;
+
+        Coordination(ReentrantLock jvmLock, FileChannel channel, FileLock fileLock,
+                long generation, int generationSlot) {
+            this.jvmLock = jvmLock;
+            this.channel = channel;
+            this.fileLock = fileLock;
+            this.generation = generation;
+            this.generationSlot = generationSlot;
         }
 
-        try {
-            if (lockChannel != null && lockChannel.isOpen()) {
-                lockChannel.close();
+        long bumpGeneration() throws IOException {
+            if (generation == Long.MAX_VALUE) {
+                throw new IOException("Database file generation exhausted");
             }
-        } catch (IOException e) {
-            originalError.addSuppressed(e);
-        } finally {
-            lockChannel = null;
+            long next = generation + 1;
+            int nextSlot = 1 - generationSlot;
+            ByteBuffer slot = ByteBuffer.allocate(GENERATION_SLOT_SIZE)
+                    .order(ByteOrder.BIG_ENDIAN)
+                    .putLong(next).putLong(~next);
+            slot.flip();
+            writeFully(channel, slot, (long) nextSlot * GENERATION_SLOT_SIZE);
+            channel.force(true);
+            generation = next;
+            generationSlot = nextSlot;
+            return next;
         }
+
+        @Override
+        public void close() throws IOException {
+            IOException failure = null;
+            try {
+                fileLock.release();
+            } catch (IOException e) {
+                failure = e;
+            }
+            try {
+                channel.close();
+            } catch (IOException e) {
+                if (failure == null) failure = e;
+                else failure.addSuppressed(e);
+            } finally {
+                jvmLock.unlock();
+            }
+            if (failure != null) throw failure;
+        }
+    }
+
+    private record GenerationState(long value, int slot) { }
+
+    private static GenerationState readGeneration(FileChannel channel) throws IOException {
+        long size = channel.size();
+        if (size == 0) {
+            writeGenerationSlot(channel, 0, 0);
+            writeGenerationSlot(channel, 1, 0);
+            channel.force(true);
+            return new GenerationState(0, 1);
+        }
+        if (size > GENERATION_FILE_SIZE) {
+            throw new IOException("Invalid database lock metadata size: " + size);
+        }
+        GenerationState best = null;
+        for (int slot = 0; slot < 2; slot++) {
+            long offset = (long) slot * GENERATION_SLOT_SIZE;
+            if (size - offset < GENERATION_SLOT_SIZE) {
+                continue;
+            }
+            ByteBuffer value = ByteBuffer.allocate(GENERATION_SLOT_SIZE)
+                    .order(ByteOrder.BIG_ENDIAN);
+            readFully(channel, value, offset);
+            value.flip();
+            long generation = value.getLong();
+            long complement = value.getLong();
+            if (generation >= 0 && complement == ~generation
+                    && (best == null || generation >= best.value())) {
+                best = new GenerationState(generation, slot);
+            }
+        }
+        if (best != null) {
+            return best;
+        }
+        // The only safe no-valid-slot case is an interrupted first-time
+        // initialization before any successful database operation.
+        if (size < GENERATION_SLOT_SIZE) {
+            writeGenerationSlot(channel, 0, 0);
+            writeGenerationSlot(channel, 1, 0);
+            channel.force(true);
+            return new GenerationState(0, 1);
+        }
+        throw new IOException("Both database lock generation slots are invalid");
+    }
+
+    private static void writeGenerationSlot(FileChannel channel, int slot, long generation)
+            throws IOException {
+        ByteBuffer value = ByteBuffer.allocate(GENERATION_SLOT_SIZE)
+                .order(ByteOrder.BIG_ENDIAN).putLong(generation).putLong(~generation);
+        value.flip();
+        writeFully(channel, value, (long) slot * GENERATION_SLOT_SIZE);
+    }
+
+    private static void writeFully(FileChannel channel, ByteBuffer buffer, long position)
+            throws IOException {
+        int zeroWrites = 0;
+        while (buffer.hasRemaining()) {
+            int written = channel.write(buffer, position);
+            if (written < 0) {
+                throw new IOException("Unexpected end while writing lock metadata");
+            }
+            if (written == 0) {
+                if (++zeroWrites > MAX_CONSECUTIVE_ZERO_READS) {
+                    throw new IOException("Channel repeatedly returned zero bytes");
+                }
+                Thread.onSpinWait();
+                continue;
+            }
+            zeroWrites = 0;
+            position += written;
+        }
+    }
+
+    private static void readFully(FileChannel channel, ByteBuffer buffer, long position)
+            throws IOException {
+        int zeroReads = 0;
+        while (buffer.hasRemaining()) {
+            int count = channel.read(buffer, position);
+            if (count < 0) {
+                throw new IOException("Unexpected end while reading lock metadata");
+            }
+            if (count == 0) {
+                if (++zeroReads > MAX_CONSECUTIVE_ZERO_READS) {
+                    throw new IOException("Channel repeatedly returned zero bytes");
+                }
+                Thread.onSpinWait();
+                continue;
+            }
+            zeroReads = 0;
+            position += count;
+        }
+    }
+
+    private void cleanupOrphanCompactionFiles() throws IOException {
+        Path parent = databasePath.getParent();
+        if (parent == null) {
+            return;
+        }
+        String pattern = databasePath.getFileName() + ".compact.*.tmp";
+        try (var candidates = Files.newDirectoryStream(parent, pattern)) {
+            for (Path candidate : candidates) {
+                Files.deleteIfExists(candidate);
+            }
+        }
+    }
+
+    /** Replays only the WAL suffix since the last verified boundary. */
+    private void refreshFromWal() throws IOException {
+        try {
+            Recovery.Report report = Recovery.recoverFrom(
+                    databasePath, index, recoveredEnd, recoveredMaxTxId);
+            publishRecovery(index, report);
+        } catch (IOException | RuntimeException e) {
+            // Recovery may have applied part of a valid suffix before finding
+            // corruption; require reopen before this index can be used again.
+            failed = true;
+            throw e;
+        }
+    }
+
+    private void refreshFromWal(Coordination coordination) throws IOException {
+        if (coordination.generation != fileGeneration) {
+            try {
+                initializeFromWal();
+                fileGeneration = coordination.generation;
+            } catch (IOException | RuntimeException e) {
+                failed = true;
+                throw e;
+            }
+        } else {
+            refreshFromWal();
+        }
+    }
+
+    /** Records the new durable WAL boundary after this instance commits a write. */
+    private void checkpointWrite(long transactionId) throws IOException {
+        recoveredEnd = wal.size();
+        recoveredMaxTxId = Math.max(recoveredMaxTxId, transactionId);
+        updateNextTransactionId(recoveredMaxTxId);
     }
 
     /**
@@ -225,18 +457,29 @@ public final class DatabaseImpl implements Database {
         try {
             ensureOpen();
 
+            try (Coordination coordination = acquireCoordination()) {
+            ensureOpen();
+            refreshFromWal(coordination);
+
             long txId = allocateTransactionId();
 
-            walTouched = true; // from here the WAL state may be uncertain
-            long offset = wal.append(RecordType.PUT, txId, payload);
+            openWalForOperation();
+            try {
+                walTouched = true; // from here the WAL state may be uncertain
+                long offset = wal.append(RecordType.PUT, txId, payload);
 
-            wal.force();
+                wal.force();
 
-            long valueOffset = offset + RecordCodec.HEADER_SIZE
-                    + 8 + keyBytes.length;
+                long valueOffset = offset + RecordCodec.HEADER_SIZE
+                        + 8 + keyBytes.length;
 
-            index.put(wrappedKey,
-                    new ValueLocation(valueOffset, valueBytes.length));
+                index.put(wrappedKey,
+                        new ValueLocation(valueOffset, valueBytes.length));
+                checkpointWrite(txId);
+            } finally {
+                closeWalForOperation();
+            }
+            }
 
         } catch (IOException | RuntimeException e) {
             if (walTouched || (wal != null && wal.isFailed())) {
@@ -257,12 +500,17 @@ public final class DatabaseImpl implements Database {
         try {
             ensureOpen();
 
+            try (Coordination coordination = acquireCoordination()) {
+            ensureOpen();
+            refreshFromWal(coordination);
+
             ValueLocation location = index.get(wrappedKey);
 
             if (location == null) {
                 return null;
             }
 
+            try (FileChannel reader = FileChannel.open(databasePath, StandardOpenOption.READ)) {
             long fileSize = reader.size();
 
             if (location.offset() > fileSize
@@ -279,6 +527,8 @@ public final class DatabaseImpl implements Database {
             }
 
             return value.array();
+            }
+            }
 
         } finally {
             lock.readLock().unlock();
@@ -299,14 +549,25 @@ public final class DatabaseImpl implements Database {
         try {
             ensureOpen();
 
+            try (Coordination coordination = acquireCoordination()) {
+            ensureOpen();
+            refreshFromWal(coordination);
+
             long txId = allocateTransactionId();
 
-            walTouched = true;
-            wal.append(RecordType.DELETE, txId, payload);
+            openWalForOperation();
+            try {
+                walTouched = true;
+                wal.append(RecordType.DELETE, txId, payload);
 
-            wal.force();
+                wal.force();
 
-            index.remove(wrappedKey);
+                index.remove(wrappedKey);
+                checkpointWrite(txId);
+            } finally {
+                closeWalForOperation();
+            }
+            }
 
         } catch (IOException | RuntimeException e) {
             if (walTouched) {
@@ -359,12 +620,18 @@ public final class DatabaseImpl implements Database {
         try {
             ensureOpen();
 
+            try (Coordination coordination = acquireCoordination()) {
+            ensureOpen();
+            refreshFromWal(coordination);
+
             long txId = allocateTransactionId();
 
             ByteBuffer beginPayload = ByteBuffer.allocate(4)
                     .order(ByteOrder.BIG_ENDIAN);
             beginPayload.putInt(safeOperations.size());
 
+            openWalForOperation();
+            try {
             // Set BEFORE the append: a partially written BEGIN that throws
             // must still leave this instance failed.
             walTouched = true;
@@ -422,6 +689,11 @@ public final class DatabaseImpl implements Database {
                     index.remove(op.key);
                 }
             }
+            checkpointWrite(txId);
+            } finally {
+                closeWalForOperation();
+            }
+            }
 
         } catch (IOException | RuntimeException e) {
             // Rejected before any WAL modification (closed, ids exhausted):
@@ -434,6 +706,193 @@ public final class DatabaseImpl implements Database {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /** Rewrites only live entries to a validated same-directory candidate WAL. */
+    @Override
+    public void compact() throws IOException {
+        lock.writeLock().lock();
+        try {
+            ensureOpen();
+            try (Coordination coordination = acquireCoordination()) {
+                ensureOpen();
+                refreshFromWal(coordination);
+                Map<ByteArrayKey, ValueLocation> sourceEntries = index.entriesSnapshot();
+                Path temporary = databasePath.resolveSibling(
+                        databasePath.getFileName() + ".compact." + UUID.randomUUID() + ".tmp");
+                boolean temporaryCreated = false;
+                boolean replacementCompleted = false;
+                try {
+                    faultInjector.beforeCandidateCreate(temporary);
+                    Files.createFile(temporary);
+                    temporaryCreated = true;
+                    Index compactedIndex = new Index();
+                    long transactionId = 1;
+                    try (FileChannel source = FileChannel.open(databasePath,
+                            StandardOpenOption.READ);
+                            WAL candidate = new WAL()) {
+                        candidate.open(temporary, maxFileBytes);
+                        for (Map.Entry<ByteArrayKey, ValueLocation> entry
+                                : sourceEntries.entrySet()) {
+                            faultInjector.beforeCandidateRecord(temporary, transactionId - 1);
+                            byte[] key = entry.getKey().bytes();
+                            ValueLocation sourceLocation = entry.getValue();
+                            ByteBuffer valueBuffer = ByteBuffer.allocate(sourceLocation.length());
+                            if (readAtMost(source, valueBuffer, sourceLocation.offset())
+                                    != sourceLocation.length()) {
+                                throw new IOException("Cannot read live value during compaction");
+                            }
+                            byte[] value = valueBuffer.array();
+                            long recordOffset = candidate.append(RecordType.PUT,
+                                    transactionId++, encodePut(key, value));
+                            compactedIndex.put(entry.getKey(), new ValueLocation(
+                                    recordOffset + RecordCodec.HEADER_SIZE + 8 + key.length,
+                                    value.length));
+                        }
+                        candidate.force();
+                    }
+
+                    faultInjector.beforeCandidateValidation(temporary);
+                    Index validatedIndex = new Index();
+                    Recovery.Report validation = Recovery.recover(temporary, validatedIndex);
+                    if (validation.bytesTruncated() != 0
+                            || validation.committedEnd() != Files.size(temporary)
+                            || validatedIndex.size() != sourceEntries.size()) {
+                        throw new IOException("Compaction candidate failed recovery validation");
+                    }
+                    verifyCompactionCandidate(sourceEntries, compactedIndex,
+                            validatedIndex, temporary);
+
+                    // Persist a generation change first. If the process dies before the
+                    // rename, all instances simply perform a harmless full recovery of
+                    // the still-authoritative old WAL. If it dies after, they must reload.
+                    long nextGeneration = coordination.bumpGeneration();
+                    faultInjector.beforeCandidateReplacement(databasePath, temporary);
+                    try {
+                        Files.move(temporary, databasePath,
+                                StandardCopyOption.ATOMIC_MOVE,
+                                StandardCopyOption.REPLACE_EXISTING);
+                        replacementCompleted = true;
+                    } catch (IOException moveFailure) {
+                        try {
+                            initializeFromWal();
+                            fileGeneration = coordination.generation;
+                        } catch (IOException | RuntimeException recoveryFailure) {
+                            failed = true;
+                            moveFailure.addSuppressed(recoveryFailure);
+                        }
+                        throw moveFailure;
+                    }
+
+                    faultInjector.afterCandidateReplacement(databasePath);
+                    index = validatedIndex;
+                    recoveredEnd = validation.committedEnd();
+                    recoveredMaxTxId = validation.maxTxId();
+                    updateNextTransactionId(recoveredMaxTxId);
+                    fileGeneration = nextGeneration;
+                } finally {
+                    if (temporaryCreated && !replacementCompleted) {
+                        Files.deleteIfExists(temporary);
+                    }
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void verifyCompactionCandidate(
+            Map<ByteArrayKey, ValueLocation> sourceEntries,
+            Index generatedIndex,
+            Index recoveredIndex,
+            Path candidatePath) throws IOException {
+        try (FileChannel source = FileChannel.open(databasePath, StandardOpenOption.READ);
+                FileChannel candidate = FileChannel.open(candidatePath, StandardOpenOption.READ)) {
+            for (Map.Entry<ByteArrayKey, ValueLocation> entry : sourceEntries.entrySet()) {
+                ValueLocation generated = generatedIndex.get(entry.getKey());
+                ValueLocation recovered = recoveredIndex.get(entry.getKey());
+                if (generated == null || recovered == null
+                        || generated.length() != recovered.length()
+                        || generated.offset() != recovered.offset()) {
+                    throw new IOException("Compaction candidate key/index mismatch");
+                }
+                byte[] sourceValue = readValue(source, entry.getValue());
+                byte[] candidateValue = readValue(candidate, recovered);
+                if (!java.util.Arrays.equals(sourceValue, candidateValue)) {
+                    throw new IOException("Compaction candidate value mismatch");
+                }
+            }
+        }
+    }
+
+    private byte[] readValue(FileChannel channel, ValueLocation location) throws IOException {
+        ByteBuffer value = ByteBuffer.allocate(location.length());
+        if (readAtMost(channel, value, location.offset()) != location.length()) {
+            throw new IOException("Incomplete value while validating compaction candidate");
+        }
+        return value.array();
+    }
+
+    /** Full integrity/recovery pass used by the command-line check operation. */
+    int checkIntegrity() throws IOException {
+        lock.writeLock().lock();
+        try {
+            ensureOpen();
+            try (Coordination coordination = acquireCoordination()) {
+                ensureOpen();
+                try {
+                    initializeFromWal();
+                    fileGeneration = coordination.generation;
+                } catch (IOException | RuntimeException e) {
+                    failed = true;
+                    throw e;
+                }
+                return index.size();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Stable key/value snapshot for CLI dump; not part of the public Database API. */
+    List<DumpEntry> dumpSnapshot() throws IOException {
+        lock.writeLock().lock();
+        try {
+            ensureOpen();
+            try (Coordination coordination = acquireCoordination()) {
+                ensureOpen();
+                refreshFromWal(coordination);
+                Map<ByteArrayKey, ValueLocation> locations = index.entriesSnapshot();
+                List<DumpEntry> entries = new ArrayList<>(locations.size());
+                try (FileChannel reader = FileChannel.open(databasePath,
+                        StandardOpenOption.READ)) {
+                for (Map.Entry<ByteArrayKey, ValueLocation> entry : locations.entrySet()) {
+                    ValueLocation location = entry.getValue();
+                    ByteBuffer value = ByteBuffer.allocate(location.length());
+                    if (readAtMost(reader, value, location.offset()) != location.length()) {
+                        throw new IOException("Incomplete stored value during dump");
+                    }
+                    entries.add(new DumpEntry(entry.getKey().bytes(), value.array()));
+                }
+                }
+                return List.copyOf(entries);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    record DumpEntry(byte[] key, byte[] value) {
+        DumpEntry {
+            key = key.clone();
+            value = value.clone();
+        }
+
+        @Override
+        public byte[] key() { return key.clone(); }
+
+        @Override
+        public byte[] value() { return value.clone(); }
     }
 
     private byte[] encodePut(byte[] key, byte[] value) {
@@ -490,7 +949,7 @@ public final class DatabaseImpl implements Database {
     }
 
     private void ensureOpen() throws IOException {
-        if (!opened || wal == null || reader == null) {
+        if (!opened) {
             throw new IOException("Database is not open");
         }
 
@@ -510,60 +969,22 @@ public final class DatabaseImpl implements Database {
                 return;
             }
 
-            IOException failure = null;
-
-            try {
-                wal.close();
-            } catch (IOException e) {
-                failure = e;
-            }
-
-            try {
-                reader.close();
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
+            try (Coordination ignored = acquireCoordination()) {
+                IOException failure = null;
+                if (wal != null) {
+                    try {
+                        closeWalForOperation();
+                    } catch (IOException e) {
+                        failure = e;
+                    }
                 }
-            }
-
-            wal = null;
-            reader = null;
-            opened = false;
-            failed = false;
-            index = new Index();
-
-            try {
-                if (processLock != null && processLock.isValid()) {
-                    processLock.release();
+                opened = false;
+                failed = false;
+                fileGeneration = -1;
+                index = new Index();
+                if (failure != null) {
+                    throw failure;
                 }
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
-                }
-            } finally {
-                processLock = null;
-            }
-
-            try {
-                if (lockChannel != null && lockChannel.isOpen()) {
-                    lockChannel.close();
-                }
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
-                }
-            } finally {
-                lockChannel = null;
-            }
-
-            if (failure != null) {
-                throw failure;
             }
 
         } finally {

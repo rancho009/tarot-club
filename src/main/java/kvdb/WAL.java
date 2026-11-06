@@ -15,8 +15,15 @@ public final class WAL implements AutoCloseable {
     private long maxFileBytes;
     private boolean failed;
     private boolean closed = true;
+    private final DatabaseFaultInjector faultInjector;
 
     public WAL() {
+        this(DatabaseFaultInjector.NONE);
+    }
+
+    WAL(DatabaseFaultInjector faultInjector) {
+        this.faultInjector = java.util.Objects.requireNonNull(faultInjector,
+                "faultInjector");
     }
 
     public synchronized void open(Path path) throws IOException {
@@ -97,6 +104,7 @@ public final class WAL implements AutoCloseable {
         ensureUsable();
 
         try {
+            faultInjector.beforeWalForce();
             channel.force(true);
         } catch (IOException e) {
             failed = true;
@@ -131,7 +139,20 @@ public final class WAL implements AutoCloseable {
         int zeroWrites = 0;
 
         while (buffer.hasRemaining()) {
-            int written = channel.write(buffer, position);
+            int requested = buffer.remaining();
+            int allowed = faultInjector.maxWalWriteChunk(requested);
+            if (allowed <= 0 || allowed > requested) {
+                throw new IOException("Invalid injected WAL write chunk: " + allowed);
+            }
+            faultInjector.beforeWalWrite(position, allowed);
+            int oldLimit = buffer.limit();
+            buffer.limit(buffer.position() + allowed);
+            int written;
+            try {
+                written = channel.write(buffer, position);
+            } finally {
+                buffer.limit(oldLimit);
+            }
 
             if (written < 0) {
                 throw new IOException("Unexpected end of WAL file");
@@ -150,6 +171,7 @@ public final class WAL implements AutoCloseable {
             }
 
             zeroWrites = 0;
+            faultInjector.afterWalWrite(position, written);
             position += written;
         }
     }

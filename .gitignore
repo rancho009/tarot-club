@@ -1,5 +1,23 @@
+# Java build output
 out/
 target/
+build/
 *.class
-*.log
+
+# IDE files
 .idea/
+.vscode/
+*.iml
+
+# Database and WAL files
+*.db
+*.wal
+*.lock
+*.oracle.jsonl
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

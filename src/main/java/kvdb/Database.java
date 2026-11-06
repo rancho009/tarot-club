@@ -17,6 +17,8 @@ public interface Database extends AutoCloseable {
 
     void batch(List<BatchOperation> operations) throws IOException;
 
+    void compact() throws IOException;
+
     @Override
     void close() throws IOException;
 }

@@ -13,8 +13,9 @@ import java.util.zip.CRC32C;
  * Contract summary (see also {@link #validateAt}):
  * <ul>
  * <li>Lengths are validated before any payload is read or allocated.</li>
- * <li>Values are never held in memory; the CRC is streamed in fixed
- * chunks.</li>
+ * <li>The CRC is streamed in fixed chunks. A bounded 8 MiB sequential-read
+ * cache may contain raw WAL bytes, including value bytes, but records are not
+ * materialized as whole values by this validator.</li>
  * <li>Only the key (at most 1024 bytes) is copied.</li>
  * <li>For BEGIN and COMMIT, the caller derives the payload location from a
  * VALID result only: payload offset = recordStart + 24, payload length =
@@ -93,7 +94,10 @@ final class RecordValidator {
     private static final int COMMIT_PAYLOAD = 8;
 
     private static final int CHUNK_SIZE = 8192;
+    private static final int READ_CACHE_SIZE = 8 * 1024 * 1024;
     private static final int MAX_CONSECUTIVE_ZERO_READS = 100;
+    private static final ThreadLocal<ReadCache> READ_CACHE =
+            ThreadLocal.withInitial(ReadCache::new);
 
     private RecordValidator() {
         // Utility class.
@@ -381,25 +385,67 @@ final class RecordValidator {
     private static int readFully(
             FileChannel ch, ByteBuffer buf, long position)
             throws IOException {
+        return readCached(ch, buf, position);
+    }
 
+    /** Shared sequential cache for the validator and Recovery's batch CRC pass. */
+    static int readCached(FileChannel channel, ByteBuffer target, long position)
+            throws IOException {
+        if (channel == null || target == null || position < 0) {
+            throw new IllegalArgumentException("Invalid cached WAL read arguments");
+        }
+        ReadCache cache = READ_CACHE.get();
         int total = 0;
-        int zeroReads = 0;
-        while (buf.hasRemaining()) {
-            int n = ch.read(buf, position + total);
-            if (n < 0) {
+        while (target.hasRemaining()) {
+            if (cache.channel != channel || position < cache.start
+                    || position >= cache.start + cache.length) {
+                cache.refill(channel, position);
+            }
+            int available = cache.length - (int) (position - cache.start);
+            if (available <= 0) {
                 break;
             }
-            if (n == 0) {
-                if (++zeroReads > MAX_CONSECUTIVE_ZERO_READS) {
-                    throw new IOException(
-                            "Channel repeatedly returned zero bytes");
-                }
-                continue;
-            }
-            zeroReads = 0;
-            total += n;
+            int count = Math.min(target.remaining(), available);
+            int sourceOffset = (int) (position - cache.start);
+            target.put(cache.bytes, sourceOffset, count);
+            position += count;
+            total += count;
         }
         return total;
+    }
+
+    static void clearReadCache() {
+        READ_CACHE.remove();
+    }
+
+    private static final class ReadCache {
+        final byte[] bytes = new byte[READ_CACHE_SIZE];
+        FileChannel channel;
+        long start;
+        int length;
+
+        void refill(FileChannel source, long position) throws IOException {
+            channel = source;
+            start = position;
+            length = 0;
+            ByteBuffer destination = ByteBuffer.wrap(bytes);
+            int zeroReads = 0;
+            while (destination.hasRemaining()) {
+                int count = source.read(destination, position + length);
+                if (count < 0) {
+                    break;
+                }
+                if (count == 0) {
+                    if (++zeroReads > MAX_CONSECUTIVE_ZERO_READS) {
+                        throw new IOException("Channel repeatedly returned zero bytes");
+                    }
+                    Thread.onSpinWait();
+                    continue;
+                }
+                zeroReads = 0;
+                length += count;
+            }
+        }
     }
 
     /**

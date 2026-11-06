@@ -81,4 +81,9 @@ public final class Index {
     public void clear() {
         index.clear();
     }
+
+    Map<ByteArrayKey, ValueLocation> entriesSnapshot() {
+        return Map.copyOf(index);
+    }
+
 }

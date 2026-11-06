@@ -31,8 +31,9 @@ import java.util.zip.CRC32C;
  * <li>A CORRUPT record or a transaction-rule violation never modifies the
  * file: the Index is cleared and {@link CorruptWalException} is thrown,
  * even when the damage lies after the last COMMIT.</li>
- * <li>Values are never buffered. Only keys and locations of the operations
- * of the one open transaction (at most 10,000) are kept in memory.</li>
+ * <li>The validator uses a bounded 8 MiB sequential byte cache that can contain
+ * raw values. Recovery retains operation keys and locations (not duplicate
+ * value arrays) for at most one open transaction.</li>
  * </ul>
  */
 final class Recovery {
@@ -113,18 +114,34 @@ final class Recovery {
      * @throws IOException         on I/O failure; the Index is left empty
      */
     static Report recover(Path walPath, Index index) throws IOException {
+        return recoverFrom(walPath, index, 0, -1);
+    }
+
+    /**
+     * Replays records appended at or after a previously verified record boundary.
+     * The caller must pass an index representing all records before startOffset
+     * and hold the database's exclusive process lock for the entire call.
+     */
+    static Report recoverFrom(
+            Path walPath, Index index, long startOffset, long priorMaxTxId)
+            throws IOException {
         if (walPath == null) {
             throw new IllegalArgumentException("WAL path cannot be null");
         }
         if (index == null) {
             throw new IllegalArgumentException("Index cannot be null");
         }
+        if (startOffset < 0 || priorMaxTxId < -1) {
+            throw new IllegalArgumentException("Invalid recovery checkpoint");
+        }
 
-        index.clear(); // Recovery always rebuilds from scratch.
+        if (startOffset == 0) {
+            index.clear();
+        }
 
         boolean success = false;
         try {
-            Report report = openAndScan(walPath, index);
+            Report report = openAndScan(walPath, index, startOffset, priorMaxTxId);
             success = true;
             return report;
         } finally {
@@ -136,17 +153,22 @@ final class Recovery {
         }
     }
 
-    private static Report openAndScan(Path walPath, Index index) throws IOException {
+    private static Report openAndScan(
+            Path walPath, Index index, long startOffset, long priorMaxTxId)
+            throws IOException {
         FileChannel opened;
         try {
             // No CREATE: a missing file is an empty log, and WAL.open creates it later.
             opened = FileChannel.open(
                     walPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
         } catch (NoSuchFileException e) {
+            index.clear();
             return new Report(0, 0, 0, 0, 0, -1, StopReason.CLEAN_END);
         }
         try (FileChannel ch = opened) {
-            return scan(ch, index);
+            return scan(ch, index, startOffset, priorMaxTxId);
+        } finally {
+            RecordValidator.clearReadCache();
         }
     }
 
@@ -154,13 +176,22 @@ final class Recovery {
     // Scan
     // ------------------------------------------------------------------
 
-    private static Report scan(FileChannel ch, Index index) throws IOException {
+    private static Report scan(
+            FileChannel ch, Index index, long startOffset, long priorMaxTxId)
+            throws IOException {
         final long fileSize = ch.size(); // read once; the validator trusts it
+        if (fileSize < startOffset) {
+            // A shorter file means the checkpoint cannot describe this WAL.
+            // Rebuild from scratch (for example, after external replacement).
+            index.clear();
+            startOffset = 0;
+            priorMaxTxId = -1;
+        }
         final byte[] chunk = new byte[CHUNK_SIZE];
-        final State s = new State();
+        final State s = new State(startOffset, priorMaxTxId);
 
         StopReason stop;
-        long offset = 0;
+        long offset = startOffset;
 
         while (true) {
             if (offset == fileSize) {
@@ -361,12 +392,18 @@ final class Recovery {
     // ------------------------------------------------------------------
 
     private static final class State {
-        long committedEnd = 0;
+        long committedEnd;
         long transactionsApplied = 0;
         long operationsApplied = 0;
-        long maxTxId = Long.MIN_VALUE;
-        boolean seenTxId = false;
+        long maxTxId;
+        boolean seenTxId;
         OpenTransaction open = null;
+
+        State(long committedEnd, long priorMaxTxId) {
+            this.committedEnd = committedEnd;
+            this.maxTxId = priorMaxTxId;
+            this.seenTxId = priorMaxTxId >= 1;
+        }
     }
 
     private static final class OpenTransaction {
@@ -420,23 +457,6 @@ final class Recovery {
     /** Positional read-fully: returns fewer bytes than requested only at EOF. */
     private static int readFully(FileChannel ch, ByteBuffer buf, long position)
             throws IOException {
-
-        int total = 0;
-        int zeroReads = 0;
-        while (buf.hasRemaining()) {
-            int n = ch.read(buf, position + total);
-            if (n < 0) {
-                break;
-            }
-            if (n == 0) {
-                if (++zeroReads > MAX_CONSECUTIVE_ZERO_READS) {
-                    throw new IOException("Channel repeatedly returned zero bytes");
-                }
-                continue;
-            }
-            zeroReads = 0;
-            total += n;
-        }
-        return total;
+        return RecordValidator.readCached(ch, buf, position);
     }
 }
